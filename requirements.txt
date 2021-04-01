@@ -1,0 +1,9 @@
+pandas
+scikit-learn
+scipy
+numpy
+matplotlib
+pyyaml
+lightgbm
+matplotlib
+networkx
