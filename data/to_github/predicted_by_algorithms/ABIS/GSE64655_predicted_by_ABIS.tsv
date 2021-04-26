@@ -1,0 +1,27 @@
+	SRR1740054	SRR1740082
+Monocytes C	21.5	17.7
+NK_cells	21.8	5.72
+T CD8 Memory	13.4	9.02
+T CD4 Naive	15.1	13.0
+T CD8 Naive	-2.76	1.51
+B Naive	2.0	2.15
+T CD4 Memory	9.17	4.52
+MAIT	4.67	6.0600000000000005
+T gd Vd2	2.02	7.64
+Neutrophils	0.536	2.59
+T gd non-Vd2	-10.6	-8.62
+Basophils	5.6800000000000015	6.98
+Monocytes NC+I	3.02	2.32
+B Memory	0.5950000000000001	3.73
+Dendritic_cells	0.5010000000000001	0.08029999999999997
+Plasmacytoid_dendritic_cells	0.203	0.0413
+Plasma_B_cells	1.15	1.09
+CD8_T_cells	10.64	10.53
+CD4_T_cells	24.27	17.52
+Monocytes	24.52	20.02
+gd_T_cells	-8.58	-0.9799999999999994
+T_cells	31.00000000000001	33.13
+Non_plasma_B_cells	2.595	5.88
+B_cells	3.745	6.97
+Lymphocytes	56.545	45.82
+Other	12.014999999999995	24.468400000000006

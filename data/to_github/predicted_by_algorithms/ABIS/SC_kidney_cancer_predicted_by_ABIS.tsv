@@ -1,0 +1,27 @@
+	AdultKidney2	AdultKidney4
+Monocytes C	1.37	0.269
+NK_cells	2.12	1.83
+T CD8 Memory	1.74	-0.382
+T CD4 Naive	11.3	15.1
+T CD8 Naive	-2.42	-0.665
+B Naive	-0.0672	0.35100000000000003
+T CD4 Memory	4.51	5.48
+MAIT	1.25	1.3
+T gd Vd2	1.28	0.149
+Neutrophils	6.17	5.29
+T gd non-Vd2	-2.43	-1.15
+Basophils	0.13699999999999998	0.138
+Monocytes NC+I	1.45	0.457
+B Memory	0.279	0.0382
+Dendritic_cells	0.853	1.37
+Plasmacytoid_dendritic_cells	0.126	0.171
+Plasma_B_cells	0.0855	0.547
+Monocytes	2.8200000000000003	0.726
+CD8_T_cells	-0.6799999999999999	-1.0470000000000002
+CD4_T_cells	15.81	20.58
+T_cells	15.230000000000004	19.832000000000004
+B_cells	0.2973	0.9362
+Non_plasma_B_cells	0.2118	0.3892000000000001
+gd_T_cells	-1.15	-1.001
+Lymphocytes	17.647300000000005	22.59820000000001
+Other	72.2467	69.7068
