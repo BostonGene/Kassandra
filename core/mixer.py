@@ -1,9 +1,13 @@
 import gc
-from typing import Dict, Set, Union, List, Tuple
 import pandas as pd
 import numpy as np
 from numpy import random
 from core.cell_types import CellTypes, get_proportions_series
+import pickle
+from pathlib import Path
+from typing import Dict
+import yaml
+from typing import Tuple, List
 
 
 class Mixer:
@@ -50,7 +54,8 @@ class Mixer:
         self.proportions = get_proportions_series(cell_types)
         self.gene_length = pd.read_csv(gene_length, sep='\t', index_col=0)
         self.cells_annot = cells_annot
-        
+        self.tumor_annot = tumor_annot
+
         self.genes_in_expression = []
         with open(genes_in_expression_path, "r") as f:
             for line in f:
@@ -60,60 +65,73 @@ class Mixer:
         self.check_expressions(cells_expr)
         print('Checking cancer cells expressions...')
         self.check_expressions(tumor_expr)
-
+            
         # renormalizing expressions
         cells_expr = cells_expr.loc[self.genes_in_expression]
-        cells_expr = (cells_expr / cells_expr.sum()) * 10**6
+        self.cells_expr = (cells_expr / cells_expr.sum()) * 10**6
         tumor_expr = tumor_expr.loc[self.genes_in_expression]
-        tumor_expr = (tumor_expr / tumor_expr.sum()) * 10**6
+        self.tumor_expr = (tumor_expr / tumor_expr.sum()) * 10**6
 
         self.tumor_mean = tumor_mean
         self.tumor_sd = tumor_sd
         self.hyperexpression_fraction = hyperexpression_fraction
         self.max_hyperexpr_level = max_hyperexpr_level
-        
-        if all_genes:
-            genes = cells_expr.index
-        else: 
-            genes = cell_types.genes
-
-        self.tumor_expr = tumor_expr.loc[genes]
-        self.cells_expr = cells_expr.loc[genes]
 
     def check_expressions(self, expr):
         '''
         Checks if expressions have the right format.
         '''
         if not any(expr.max(axis=1) > np.log2(10**6)):
-            raise ValueError("MODEL DOES NOT WORK WITH LOG NORMALIZED DATA. LINEARIZE YOUR EXPRESSION MATRIX.")
+            raise ValueError("MODEL DOES NOT WORK WITH LOG NORMALIZED DATA. LINEARIZE YOUR EXPRESSION MATRXI.")
         diff = set(self.cell_types.genes).difference(set(expr.index))
         if diff:
-            raise ValueError(f'MISSING GENES IN EXPRESSION: \n {diff}')
+            raise ValueError("EXPRESSION MATRIX HAS TO CONTAIN AT LEAST ALL THE GENES THAT ARE USED AS A FEATURES")
         diff = set(self.cell_types.genes).symmetric_difference(set(expr.index))
         if not diff:
-            print(f'WARNING: YOU USING ONLY FEATURE GENES. MAKE SURE THAT EXPRESSIONS WERE NORMALIZED ON THIS SET OF GENES.')
+            print(f'WARNING: YOU USING ONLY FEATURE GENES. MAKE SURE THAT NORMALIZATION IS CORRECT')
         else:
             print("Expressions OK")
 
+    def get_cells_to_mix(self, modeled_cell: str) -> List[str]:
+        """
+        Returns list of cells to mix for modeld cell type.
+        """
+        cells_to_remove = [modeled_cell]
+        cells_to_remove += self.cell_types.get_all_parents(modeled_cell)
+        cells_to_remove += self.cell_types.get_all_subtypes(modeled_cell)
+        cells_to_mix = []
+        for cell in cells_to_remove:
+            cells_to_mix += self.cell_types.get_direct_subtypes(cell)
+
+        cells_to_mix = [cell for cell in cells_to_mix if cell not in cells_to_remove]
+        return  cells_to_mix
+
     def generate(self,
                  modeled_cell: str,
-                 make_noise: bool = True,
+                 genes=None,
                  random_seed: int = 0) -> Tuple[pd.DataFrame, pd.Series]:
         """
         Generates mixes for cell model training.
+        :genes: Subset of genes outputed in resulted mixes expressions. Uses genes for cell type from config if None. 
+        Affects execution speed. 
         :modeled_cell: Cell type for which model training mixes is to be assambled
         :random_seed: random seed
         :returns: tuple with dataframes of mixed expressions and rna proportions
         """
         np.random.seed(random_seed)
 
-        mixed_cells_expr = pd.DataFrame(np.zeros((len(self.cells_expr.index), self.num_points)),
-                                        index=self.cells_expr.index,
+        if not genes:
+            genes = self.cell_types[modeled_cell].genes
+    
+        mixed_cells_expr = pd.DataFrame(np.zeros((len(genes), self.num_points)),
+                                        index=genes,
                                         columns=range(self.num_points), dtype=float)
 
         cells_to_mix = self.get_cells_to_mix(modeled_cell)
-        average_cells = self.generate_pure_cell_expressions(self.num_av, cells_to_mix + [modeled_cell])
-        mixed_cells_values = self.concat_ratios_with_dirichlet(cells_to_mix)
+
+        average_cells = {**self.generate_pure_cell_expressions(genes, 1, cells_to_mix),
+                         **self.generate_pure_cell_expressions(genes, self.num_av, [modeled_cell])}
+        mixed_cells_values = self.dirichlet_mixing(self.num_points, cells_to_mix)
 
         for cell in mixed_cells_values.index:
             mixed_cells_expr += mixed_cells_values.loc[cell] * average_cells[cell]
@@ -130,7 +148,7 @@ class Mixer:
                                                      sd=self.tumor_sd)
 
         microenvironment_fractions = 1 - tumor_values
-        tumor_expr_reshaped = self.tumor_expr.sample(self.num_points, replace=True,
+        tumor_expr_reshaped = self.tumor_expr.loc[genes].sample(self.num_points, replace=True,
                                                      axis=1, random_state=random_seed)
         tumor_expr_reshaped.columns = range(self.num_points)
         tumor_expr_reshaped = self.add_tumor_hyperexpression(tumor_expr_reshaped,
@@ -140,8 +158,87 @@ class Mixer:
         tumor_with_cells_values = mixed_cells_values * microenvironment_fractions
         tumor_with_cells_values.loc['Tumor'] = tumor_values
         tumor_with_cells_expr = self.make_noise(tumor_with_cells_expr)
-        gc.collect()
+        
         return tumor_with_cells_expr, tumor_with_cells_values
+    
+    def generate_pure_cell_expressions(self, genes: list, num_av: int, cells_to_mix: List[str]) -> Dict[str, float]:
+        """
+        Function makes averaged samples of random cellular samples, taking into account the nested structure
+        of the subtypes and the desired proportions of the subtypes for cell type.
+        :param cells_to_mix: list of cell types for which averaged samples from random selection will be formed
+        :param num_av: number of random samples of cell type that will be averaged to form the resulting sample
+        :returns: dict with matrix of average of random num_av samples for each cell type with replacement
+        """
+        average_cells = {}
+        cells_expr = self.cells_expr.loc[genes]
+        for cell in cells_to_mix:
+            cells_selection = self.select_cells_with_subtypes(cell)
+            expressions_matrix = pd.DataFrame(np.zeros((len(cells_expr.index), self.num_points)),
+                                              index=cells_expr.index,
+                                              columns=range(self.num_points), dtype=float)
+            for i in range(num_av):
+                if self.rebalance_param is not None:
+                    cells_index = pd.Index(self.rebalance_samples_by_type(self.cells_annot.loc[cells_selection.index],
+                                                                          k=self.rebalance_param))
+                else:
+                    cells_index = cells_selection.index
+                if self.proportions is not None:
+                    cell_subtypes = self.cell_types.get_all_subtypes(cell)
+                    specified_subtypes = set(self.proportions.dropna().index).intersection(cell_subtypes)
+                    if len(specified_subtypes) > 1:
+                        cells_index = self.change_subtype_proportions(cell=cell,
+                                                                      cells_index=cells_index)
+                samples = random.choice(cells_index, self.num_points)
+                expressions_matrix += cells_expr.loc[:, samples].values
+            average_cells[cell] = expressions_matrix / float(num_av)
+        return average_cells
+    
+    def dirichlet_mixing(self, num_points: int, cells_to_mix: List[str]):
+        """
+        Method generates the values of the proportion of mixed cells by dirichlet method.
+        The method guarantees a high probability of the the presence of each cell type from 0 to 100%
+        at the expense of enrichment of fractions close to zero.
+        :param num_points: int number of how many mixes to create
+        :param cells_to_mix: list of cell types to mix
+        :returns: pandas dataframe with generated cell type fractions
+        """
+        return pd.DataFrame(np.random.dirichlet([1.0 / len(cells_to_mix)]*len(cells_to_mix), size=num_points).T,
+                            index=cells_to_mix, columns=range(num_points))
+
+    def normal_cell_distribution(self, sd=0.5, mean=0.5) -> float:
+        """
+        Generates vector with normal distribution truncated on [0,1] for cell mixing.
+        :param sd: Standard deviation
+        :param mean: mean
+        :returns: np.array with values
+        """
+        values = sd * np.random.randn(self.num_points) + mean
+        values[values < 0] = np.random.uniform(size=len(values[values < 0]))
+        values[values > 1] = np.random.uniform(size=len(values[values > 1]))
+        return values
+
+    def select_cells_with_subtypes(self, cell: str) -> pd.DataFrame:
+        """
+        Method makes a selection of all cell type samples with all level nested subtypes.
+        :param cell: cell type from names in 'Cell_type'
+        :returns: pandas Series with samples indexes and cell names
+        """
+        selected_cells = [cell] + self.cell_types.get_all_subtypes(cell)
+        return self.cells_annot[self.cells_annot['Cell_type'].isin(selected_cells)]
+
+    @staticmethod
+    def add_tumor_hyperexpression(data, hyperexpression_fraction, max_hyperexpr_level):
+        """
+        :param data: pandas dataframe with expressions in TPM
+        :param hyperexpression_fraction: probability for gene to be hyperexpressed
+        :param max_hyperexpr_level: maximum level of tumor expression
+        :return:
+        """
+        tumor_noise = np.random.random(size=data.shape)
+        tumor_noise = np.where(tumor_noise < hyperexpression_fraction, max_hyperexpr_level, 0)
+        tumor_noise = tumor_noise * np.random.random(size=data.shape)
+        data = data + tumor_noise
+        return data
 
 
     @staticmethod
@@ -171,46 +268,6 @@ class Mixer:
             samples.extend(np.random.choice(annot.loc[annot['Dataset'] == t].index, counter))
 
         return pd.Index(samples)
-
-    def generate_pure_cell_expressions(self, num_av: int, cells_to_mix: List[str]) -> Dict[str, float]:
-        """
-        Function makes averaged samples of random cellular samples, taking into account the nested structure
-        of the subtypes and the desired proportions of the subtypes for cell type.
-        :param cells_to_mix: list of cell types for which averaged samples from random selection will be formed
-        :param num_av: number of random samples of cell type that will be averaged to form the resulting sample
-        :returns: dict with matrix of average of random num_av samples for each cell type with replacement
-        """
-        average_cells = {}
-        for cell in cells_to_mix:
-            cells_selection = self.select_cells_with_subtypes(cell)
-            expressions_matrix = pd.DataFrame(np.zeros((len(self.cells_expr.index), self.num_points)),
-                                              index=self.cells_expr.index,
-                                              columns=range(self.num_points), dtype=float)
-            for i in range(num_av):
-                if self.rebalance_param is not None:
-                    cells_index = pd.Index(self.rebalance_samples_by_type(self.cells_annot.loc[cells_selection.index],
-                                                                          k=self.rebalance_param))
-                else:
-                    cells_index = cells_selection.index
-                if self.proportions is not None:
-                    cell_subtypes = self.cell_types.get_all_subtypes(cell)
-                    specified_subtypes = set(self.proportions.dropna().index).intersection(cell_subtypes)
-                    if len(specified_subtypes) > 1:
-                        cells_index = self.change_subtype_proportions(cell=cell,
-                                                                      cells_index=cells_index)
-                samples = random.choice(cells_index, self.num_points)
-                expressions_matrix += self.cells_expr.loc[:, samples].values
-            average_cells[cell] = expressions_matrix / float(num_av)
-        return average_cells
-
-    def select_cells_with_subtypes(self, cell: str) -> pd.DataFrame:
-        """
-        Method makes a selection of all cell type samples with all level nested subtypes.
-        :param cell: cell type from names in 'Cell_type'
-        :returns: pandas Series with samples indexes and cell names
-        """
-        selected_cells = [cell] + self.cell_types.get_all_subtypes(cell)
-        return self.cells_annot[self.cells_annot['Cell_type'].isin(selected_cells)]
 
     def change_subtype_proportions(self, cell: str, cells_index: pd.Index) -> pd.Index:
         """
@@ -252,76 +309,6 @@ class Mixer:
             result_samples = np.concatenate((result_samples, oversampled_subtypes[subtype]))
         return result_samples
 
-    def concat_ratios_with_dirichlet(self, cells_to_mix: List[str], dirichlet_samples_proportion=0.4):
-        """
-        Function generates the values of the proportion of mixed cells by combining simple_ratios and dirichlet methods.
-        :param num_points: int number of how many mixes to create
-        :param likely_proportions: None for uniform proportions or pandas Series with numbers for proportions for each type
-        :param cells_to_mix: list of cell types to mix
-        :param dirichlet_samples_proportion: fraction of cell mixes that will be formed through the dirichlet distribution
-                                             for method 'concat_ratios_with_dirichlet'
-                                             Value must be in the range from 0 to 1.
-        :returns: pandas dataframe with generated cell type fractions
-        """
-        num_dirichlet_points = int(self.num_points * dirichlet_samples_proportion)
-        mix_ratios_values = self.simple_ratios_mixing(self.num_points - num_dirichlet_points, cells_to_mix)
-        mix_dirichlet_values = self.dirichlet_mixing(num_dirichlet_points, cells_to_mix)
-        mix_cell_values = pd.concat([mix_ratios_values, mix_dirichlet_values], axis=1)
-        mix_cell_values.columns = range(self.num_points)
-        return mix_cell_values
-
-    def simple_ratios_mixing(self, num_points: int, cells_to_mix: List[str]):
-        """
-        Method generates the values of the proportion of mixed cells by simple ratios method.
-        In this method, the areas of values in the region of given proportions are well enriched,
-        but very few values that far from these areas.
-        :param num_points: int number of how many mixes to create
-        :param cells_to_mix: list of cell types to mix
-        :returns: pandas dataframe with generated cell type fractions
-        """
-        mixed_cell_values = pd.DataFrame(np.random.random(size=(len(cells_to_mix), num_points)),
-                                         index=cells_to_mix, columns=range(num_points))
-        mixed_cell_values = (mixed_cell_values.T * self.proportions.loc[cells_to_mix]).T
-        return mixed_cell_values / mixed_cell_values.sum()
-
-    def dirichlet_mixing(self, num_points: int, cells_to_mix: List[str]):
-        """
-        Method generates the values of the proportion of mixed cells by dirichlet method.
-        The method guarantees a high probability of the the presence of each cell type from 0 to 100%
-        at the expense of enrichment of fractions close to zero.
-        :param num_points: int number of how many mixes to create
-        :param cells_to_mix: list of cell types to mix
-        :returns: pandas dataframe with generated cell type fractions
-        """
-        return pd.DataFrame(np.random.dirichlet([1.0 / len(cells_to_mix)]*len(cells_to_mix), size=num_points).T,
-                            index=cells_to_mix, columns=range(num_points))
-
-    def get_cells_to_mix(self, modeled_cell: str) -> List[str]:
-        """
-        Returns list of cells to mix for modeld cell type.
-        """
-        cells_to_remove = [modeled_cell]
-        cells_to_remove += self.cell_types.get_all_parents(modeled_cell)
-        cells_to_remove += self.cell_types.get_all_subtypes(modeled_cell)
-        cells_to_mix = []
-        for cell in cells_to_remove:
-            cells_to_mix += self.cell_types.get_direct_subtypes(cell)
-
-        cells_to_mix = [cell for cell in cells_to_mix if cell not in cells_to_remove]
-        return  cells_to_mix
-
-    def normal_cell_distribution(self, sd=0.5, mean=0.5) -> float:
-        """
-        Generates vector with normal distribution truncated on [0,1] for cell mixing.
-        :param sd: Standard deviation
-        :param mean: mean
-        :returns: np.array with values
-        """
-        values = sd * np.random.randn(self.num_points) + mean
-        values[values < 0] = np.random.uniform(size=len(values[values < 0]))
-        values[values > 1] = np.random.uniform(size=len(values[values > 1]))
-        return values
-
     def make_noise(self,
                    data: pd.DataFrame,
                    poisson_noise_level=0.5,
@@ -336,38 +323,3 @@ class Mixer:
         data = data + np.sqrt(length_normed_data * poisson_noise_level) * np.random.normal(size=data.shape) + \
             uniform_noise_level * data * np.random.normal(size=data.shape)
         return data.clip(lower=0)
-
-    @staticmethod
-    def add_tumor_hyperexpression(data, hyperexpression_fraction, max_hyperexpr_level):
-        """
-        :param data: pandas dataframe with expressions in TPM
-        :param hyperexpression_fraction: probability for gene to be hyperexpressed
-        :param max_hyperexpr_level: maximum level of tumor expression
-        :return:
-        """
-        tumor_noise = np.random.random(size=data.shape)
-        tumor_noise = np.where(tumor_noise < hyperexpression_fraction, max_hyperexpr_level, 0)
-        tumor_noise = tumor_noise * np.random.random(size=data.shape)
-        data = data + tumor_noise
-        return data
-
-    def select_datasets_fraction(self, annotation, selector_col, bootstrap_fraction):
-        """
-        Function selects random datasets for every cell name (without nested subtypes) without replacement
-        :param annotation: pandas dataframe with colum 'Dataset' and samples as index
-        :param bootstrap_fraction: fraction of datasets to select
-        :returns: list of sample indexes for selected datasets
-        """
-        selected_samples = []
-        values = annotation[selector_col].unique()
-        for value in values:
-            value_inds = annotation.loc[annotation[selector_col] == value].index
-            value_inds = value_inds.difference(selected_samples)
-            cell_datasets = set(annotation.loc[value_inds, 'Dataset'].unique())
-            if cell_datasets:
-                selected_datasets = np.random.choice(list(cell_datasets),
-                                                     int(len(cell_datasets) * bootstrap_fraction) + 1,
-                                                     replace=False)
-                selected_samples.extend(annotation[
-                    annotation['Dataset'].isin(selected_datasets)].index.intersection(value_inds))
-        return selected_samples
